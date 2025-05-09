@@ -1,0 +1,20 @@
+version: "2"
+formatters:
+  enable:
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default #
+        - prefix(github.com/ix64/netbird-dns-sync)
+        - blank
+        - dot
+        - alias
+        - localmodule
+
+linters:
+  exclusions:
+    rules:
+      - linters: [ errcheck ]
+        source: "^\\s*defer\\s+"
