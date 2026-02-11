@@ -3,13 +3,10 @@ package sync
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
-	"slices"
 	"strings"
 	"time"
 
@@ -75,19 +72,9 @@ func (t *Sync) Run(ctx context.Context) error {
 	}
 
 	for _, v := range resp {
-		ok, err := t.assertRecord(ctx, v.DNSLabel, v.IP)
-		if err != nil {
-			return fmt.Errorf("assert domain(%s): %w", v.DNSLabel, err)
+		if err := t.syncRecord(ctx, v.DNSLabel, v.IP); err != nil {
+			return fmt.Errorf("sync record(%s): %w", v.DNSLabel, err)
 		}
-		if ok {
-			slog.Info("dns record exist", slog.String("domain", v.DNSLabel), slog.String("ip", v.IP))
-			continue
-		}
-
-		if err := t.setupRecord(ctx, v.DNSLabel, v.IP); err != nil {
-			return fmt.Errorf("setup record(%s): %w", v.DNSLabel, err)
-		}
-		slog.Info("dns record setup", slog.String("domain", v.DNSLabel), slog.String("ip", v.IP))
 	}
 	return nil
 }
@@ -119,28 +106,6 @@ func (t *Sync) getPeers(ctx context.Context) ([]netbird.Peer, error) {
 	return respBody, nil
 }
 
-func (t *Sync) assertRecord(ctx context.Context, domain string, ipStr string) (bool, error) {
-
-	ip, err := netip.ParseAddr(ipStr)
-	if err != nil {
-		return false, fmt.Errorf("parse ip: %w", err)
-	}
-
-	ips, err := t.resolver.LookupNetIP(ctx, "ip4", domain)
-	if err != nil {
-		if dnsErr, ok := errors.AsType[*net.DNSError](err); ok && dnsErr.IsNotFound {
-			return false, nil
-		}
-		return false, fmt.Errorf("lookup %s: %w", domain, err)
-	}
-
-	for _, v := range ips {
-		slog.Debug("exist dns record", slog.String("domain", domain), slog.String("ip", v.String()))
-	}
-
-	return slices.ContainsFunc(ips, func(v netip.Addr) bool { return ip.Compare(v) == 0 }), nil
-}
-
 func (t *Sync) initZone(ctx context.Context) error {
 	ret, err := t.cloudflare.Zones.List(ctx, zones.ZoneListParams{
 		Name: cloudflare.String(t.cfg.CloudflareDomain),
@@ -157,8 +122,7 @@ func (t *Sync) initZone(ctx context.Context) error {
 	return nil
 }
 
-func (t *Sync) setupRecord(ctx context.Context, domain string, ipStr string) error {
-	// TODO: remove incorrect record
+func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) error {
 	name, ok := strings.CutSuffix(domain, "."+t.cfg.CloudflareDomain)
 	if !ok {
 		return fmt.Errorf("invalid domain %s without suffix %s", domain, t.cfg.CloudflareDomain)
@@ -174,8 +138,91 @@ func (t *Sync) setupRecord(ctx context.Context, domain string, ipStr string) err
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("update dns record: %w", err)
+		return fmt.Errorf("create record: %w", err)
 	}
 
+	return nil
+}
+
+func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) error {
+	if _, ok := strings.CutSuffix(domain, "."+t.cfg.CloudflareDomain); !ok {
+		return fmt.Errorf("invalid domain %s without suffix %s", domain, t.cfg.CloudflareDomain)
+	}
+
+	list, err := t.cloudflare.DNS.Records.List(ctx, dns.RecordListParams{
+		ZoneID: cloudflare.String(t.cloudflareZoneID),
+		Name: cloudflare.F(dns.RecordListParamsName{
+			Exact: cloudflare.F(domain),
+		}),
+		Type: cloudflare.F(dns.RecordListParamsTypeA),
+	})
+	if err != nil {
+		return fmt.Errorf("list record(%s): %w", domain, err)
+	}
+
+	// create if empty
+	if len(list.Result) == 0 {
+		if err := t.createRecord(ctx, domain, ipStr); err != nil {
+			return err
+		}
+		slog.Info("dns record setup", slog.String("domain", domain), slog.String("ip", ipStr))
+		return nil
+	}
+
+	var keepID string
+	for _, record := range list.Result {
+		if record.Content == ipStr {
+			keepID = record.ID
+			break
+		}
+	}
+
+	if keepID == "" {
+		target := list.Result[0]
+		if err := t.updateRecord(ctx, target.ID, domain, ipStr, target.Proxied); err != nil {
+			return err
+		}
+		keepID = target.ID
+		slog.Info("dns record updated", slog.String("domain", domain), slog.String("ip", ipStr))
+	} else {
+		slog.Info("dns record exist", slog.String("domain", domain), slog.String("ip", ipStr))
+	}
+
+	for _, record := range list.Result {
+		if record.ID == keepID {
+			continue
+		}
+		if err := t.deleteRecord(ctx, record.ID); err != nil {
+			return err
+		}
+		slog.Info("dns record removed", slog.String("domain", domain), slog.String("ip", record.Content))
+	}
+
+	return nil
+}
+
+func (t *Sync) updateRecord(ctx context.Context, recordID string, domain string, ipStr string, proxied bool) error {
+	_, err := t.cloudflare.DNS.Records.Update(ctx, recordID, dns.RecordUpdateParams{
+		ZoneID: cloudflare.String(t.cloudflareZoneID),
+		Body: dns.ARecordParam{
+			Type:    cloudflare.F(dns.ARecordTypeA),
+			Name:    cloudflare.String(domain),
+			Content: cloudflare.String(ipStr),
+			Proxied: cloudflare.Bool(proxied),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("update record(%s): %w", domain, err)
+	}
+	return nil
+}
+
+func (t *Sync) deleteRecord(ctx context.Context, recordID string) error {
+	_, err := t.cloudflare.DNS.Records.Delete(ctx, recordID, dns.RecordDeleteParams{
+		ZoneID: cloudflare.String(t.cloudflareZoneID),
+	})
+	if err != nil {
+		return fmt.Errorf("delete record(%s): %w", recordID, err)
+	}
 	return nil
 }

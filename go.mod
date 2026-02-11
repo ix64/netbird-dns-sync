@@ -3,7 +3,7 @@ module github.com/ix64/netbird-dns-sync
 go 1.26
 
 require (
-	github.com/cloudflare/cloudflare-go/v6 v6.0.0
+	github.com/cloudflare/cloudflare-go/v6 v6.7.0
 	github.com/go-co-op/gocron/v2 v2.19.1
 	github.com/urfave/cli/v3 v3.6.2
 )
