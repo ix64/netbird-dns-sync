@@ -13,6 +13,8 @@ import (
 	"github.com/go-co-op/gocron/v2"
 	"github.com/urfave/cli/v3"
 
+	_ "golang.org/x/crypto/x509roots/fallback"
+
 	"github.com/ix64/netbird-dns-sync/internal/sync"
 )
 

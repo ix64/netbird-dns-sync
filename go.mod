@@ -6,6 +6,7 @@ require (
 	github.com/cloudflare/cloudflare-go/v6 v6.7.0
 	github.com/go-co-op/gocron/v2 v2.19.1
 	github.com/urfave/cli/v3 v3.6.2
+	golang.org/x/crypto/x509roots/fallback v0.0.0-20260209214922-2f26647a795e
 )
 
 require (
