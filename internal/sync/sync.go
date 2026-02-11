@@ -66,16 +66,19 @@ func (t *Sync) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("get peers: %w", err)
 	}
+	slog.Info("netbird peers", slog.Int("count", len(resp)))
 
 	if err := t.initZone(ctx); err != nil {
 		return fmt.Errorf("init zone: %w", err)
 	}
+	slog.Info("zone ready", slog.String("domain", t.cfg.CloudflareDomain))
 
 	for _, v := range resp {
 		if err := t.syncRecord(ctx, v.DNSLabel, v.IP); err != nil {
 			return fmt.Errorf("sync record(%s): %w", v.DNSLabel, err)
 		}
 	}
+	slog.Info("sync completed", slog.Int("records", len(resp)))
 	return nil
 }
 
@@ -119,6 +122,7 @@ func (t *Sync) initZone(ctx context.Context) error {
 	}
 
 	t.cloudflareZoneID = ret.Result[0].ID
+	slog.Info("cloudflare zone initialized", slog.String("zone_id", t.cloudflareZoneID))
 	return nil
 }
 
