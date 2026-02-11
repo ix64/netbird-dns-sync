@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudflare/cloudflare-go/v4"
-	"github.com/cloudflare/cloudflare-go/v4/dns"
-	"github.com/cloudflare/cloudflare-go/v4/option"
-	"github.com/cloudflare/cloudflare-go/v4/zones"
+	"github.com/cloudflare/cloudflare-go/v6"
+	"github.com/cloudflare/cloudflare-go/v6/dns"
+	"github.com/cloudflare/cloudflare-go/v6/option"
+	"github.com/cloudflare/cloudflare-go/v6/zones"
 
 	"github.com/ix64/netbird-dns-sync/internal/netbird"
 )
@@ -128,8 +128,7 @@ func (t *Sync) assertRecord(ctx context.Context, domain string, ipStr string) (b
 
 	ips, err := t.resolver.LookupNetIP(ctx, "ip4", domain)
 	if err != nil {
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		if dnsErr, ok := errors.AsType[*net.DNSError](err); ok && dnsErr.IsNotFound {
 			return false, nil
 		}
 		return false, fmt.Errorf("lookup %s: %w", domain, err)
@@ -167,7 +166,7 @@ func (t *Sync) setupRecord(ctx context.Context, domain string, ipStr string) err
 
 	_, err := t.cloudflare.DNS.Records.New(ctx, dns.RecordNewParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
-		Record: dns.ARecordParam{
+		Body: dns.ARecordParam{
 			Type:    cloudflare.F(dns.ARecordTypeA),
 			Name:    cloudflare.String(name),
 			Content: cloudflare.String(ipStr),
