@@ -14,6 +14,7 @@ type Peer struct {
 	UserID string `json:"user_id"`
 
 	IP       string `json:"ip"`
+	IPv6     string `json:"ipv6"` // empty unless IPv6 is enabled for the peer (Netbird v0.71.0+)
 	DNSLabel string `json:"dns_label"`
 
 	AccessiblePeersCount        int         `json:"accessible_peers_count"`

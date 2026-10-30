@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -31,6 +32,34 @@ const (
 	resultCreated
 	resultUpdated
 )
+
+const (
+	typeA    = "A"
+	typeAAAA = "AAAA"
+)
+
+// recordKey identifies a record set by type and lowercased name.
+type recordKey struct {
+	typ  string
+	name string
+}
+
+// peerRecord is one address record a peer should have.
+type peerRecord struct {
+	typ string
+	ip  string
+}
+
+func peerRecords(p netbird.Peer) []peerRecord {
+	var out []peerRecord
+	if p.IP != "" {
+		out = append(out, peerRecord{typ: typeA, ip: p.IP})
+	}
+	if p.IPv6 != "" {
+		out = append(out, peerRecord{typ: typeAAAA, ip: p.IPv6})
+	}
+	return out
+}
 
 type Config struct {
 	NetbirdEndpoint    string
@@ -72,31 +101,38 @@ func (t *Sync) Run(ctx context.Context) error {
 	}
 
 	var created, updated, unchanged, skipped, failed int
-	keep := make(map[string]struct{}, len(resp))
+	keep := make(map[recordKey]struct{}, len(resp))
 	for _, v := range resp {
 		if reason := t.skipReason(v); reason != "" {
 			slog.Debug("peer skipped",
 				slog.String("record", v.DNSLabel),
 				slog.String("ip", v.IP),
+				slog.String("ipv6", v.IPv6),
 				slog.String("reason", reason),
 			)
 			skipped++
 			continue
 		}
-		keep[strings.ToLower(v.DNSLabel)] = struct{}{}
-		result, err := t.syncRecord(ctx, v.DNSLabel, v.IP)
-		if err != nil {
-			slog.Error("sync record failed", slog.String("record", v.DNSLabel), slog.Any("error", err))
-			failed++
-			continue
-		}
-		switch result {
-		case resultCreated:
-			created++
-		case resultUpdated:
-			updated++
-		default:
-			unchanged++
+		for _, r := range peerRecords(v) {
+			keep[recordKey{typ: r.typ, name: strings.ToLower(v.DNSLabel)}] = struct{}{}
+			result, err := t.syncRecord(ctx, v.DNSLabel, r.typ, r.ip)
+			if err != nil {
+				slog.Error("sync record failed",
+					slog.String("record", v.DNSLabel),
+					slog.String("type", r.typ),
+					slog.Any("error", err),
+				)
+				failed++
+				continue
+			}
+			switch result {
+			case resultCreated:
+				created++
+			case resultUpdated:
+				updated++
+			default:
+				unchanged++
+			}
 		}
 	}
 
@@ -120,7 +156,7 @@ func (t *Sync) Run(ctx context.Context) error {
 
 // skipReason returns why a peer gets no record, or "" if it should be synced.
 func (t *Sync) skipReason(p netbird.Peer) string {
-	if p.IP == "" {
+	if p.IP == "" && p.IPv6 == "" {
 		return "no ip"
 	}
 	if _, ok := t.recordName(p.DNSLabel); !ok {
@@ -193,16 +229,45 @@ func (t *Sync) initZone(ctx context.Context) error {
 	return nil
 }
 
-func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) error {
-	_, err := t.cloudflare.DNS.Records.New(ctx, dns.RecordNewParams{
-		ZoneID: cloudflare.String(t.cloudflareZoneID),
-		Body: dns.ARecordParam{
-			Type:    cloudflare.F(dns.ARecordTypeA),
+// recordBody is a record param accepted by both create and update.
+type recordBody interface {
+	dns.RecordNewParamsBodyUnion
+	dns.RecordUpdateParamsBodyUnion
+}
+
+func recordParam(typ string, domain string, ipStr string, proxied bool) recordBody {
+	if typ == typeAAAA {
+		return dns.AAAARecordParam{
+			Type:    cloudflare.F(dns.AAAARecordTypeAAAA),
 			Name:    cloudflare.String(domain),
 			Content: cloudflare.String(ipStr),
-			Proxied: cloudflare.Bool(false),
+			Proxied: cloudflare.Bool(proxied),
 			Comment: cloudflare.String(managedComment),
-		},
+		}
+	}
+	return dns.ARecordParam{
+		Type:    cloudflare.F(dns.ARecordTypeA),
+		Name:    cloudflare.String(domain),
+		Content: cloudflare.String(ipStr),
+		Proxied: cloudflare.Bool(proxied),
+		Comment: cloudflare.String(managedComment),
+	}
+}
+
+// sameIP compares addresses by value, since Cloudflare may format IPv6 differently.
+func sameIP(a, b string) bool {
+	x, errX := netip.ParseAddr(a)
+	y, errY := netip.ParseAddr(b)
+	if errX != nil || errY != nil {
+		return a == b
+	}
+	return x == y
+}
+
+func (t *Sync) createRecord(ctx context.Context, domain string, typ string, ipStr string) error {
+	_, err := t.cloudflare.DNS.Records.New(ctx, dns.RecordNewParams{
+		ZoneID: cloudflare.String(t.cloudflareZoneID),
+		Body:   recordParam(typ, domain, ipStr, false),
 	})
 	if err != nil {
 		return fmt.Errorf("create record: %w", err)
@@ -211,13 +276,13 @@ func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) er
 	return nil
 }
 
-func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) (syncResult, error) {
+func (t *Sync) syncRecord(ctx context.Context, domain string, typ string, ipStr string) (syncResult, error) {
 	list, err := t.cloudflare.DNS.Records.List(ctx, dns.RecordListParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
 		Name: cloudflare.F(dns.RecordListParamsName{
 			Exact: cloudflare.F(domain),
 		}),
-		Type: cloudflare.F(dns.RecordListParamsTypeA),
+		Type: cloudflare.F(dns.RecordListParamsType(typ)),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("list record(%s): %w", domain, err)
@@ -225,16 +290,16 @@ func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) (syn
 
 	// create if empty
 	if len(list.Result) == 0 {
-		if err := t.createRecord(ctx, domain, ipStr); err != nil {
+		if err := t.createRecord(ctx, domain, typ, ipStr); err != nil {
 			return 0, err
 		}
-		slog.Info("dns record created", slog.String("record", domain), slog.String("ip", ipStr))
+		slog.Info("dns record created", slog.String("record", domain), slog.String("type", typ), slog.String("ip", ipStr))
 		return resultCreated, nil
 	}
 
 	keepIdx := -1
 	for i, record := range list.Result {
-		if record.Content == ipStr {
+		if sameIP(record.Content, ipStr) {
 			keepIdx = i
 			break
 		}
@@ -245,27 +310,28 @@ func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) (syn
 	switch {
 	case keepIdx < 0:
 		target := list.Result[0]
-		if err := t.updateRecord(ctx, target.ID, domain, ipStr, target.Proxied); err != nil {
+		if err := t.updateRecord(ctx, target.ID, domain, typ, ipStr, target.Proxied); err != nil {
 			return 0, err
 		}
 		keepID = target.ID
 		slog.Info("dns record updated",
 			slog.String("record", domain),
+			slog.String("type", typ),
 			slog.String("ip", ipStr),
 			slog.String("old_ip", target.Content),
 		)
 	case list.Result[keepIdx].Comment != managedComment:
 		// adopt records created before ownership marking, so they can be cleaned up later
 		target := list.Result[keepIdx]
-		if err := t.updateRecord(ctx, target.ID, domain, ipStr, target.Proxied); err != nil {
+		if err := t.updateRecord(ctx, target.ID, domain, typ, ipStr, target.Proxied); err != nil {
 			return 0, err
 		}
 		keepID = target.ID
-		slog.Info("dns record adopted", slog.String("record", domain), slog.String("ip", ipStr))
+		slog.Info("dns record adopted", slog.String("record", domain), slog.String("type", typ), slog.String("ip", ipStr))
 	default:
 		keepID = list.Result[keepIdx].ID
 		result = resultUnchanged
-		slog.Debug("dns record unchanged", slog.String("record", domain), slog.String("ip", ipStr))
+		slog.Debug("dns record unchanged", slog.String("record", domain), slog.String("type", typ), slog.String("ip", ipStr))
 	}
 
 	for _, record := range list.Result {
@@ -276,22 +342,20 @@ func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) (syn
 			return 0, err
 		}
 		result = resultUpdated
-		slog.Info("duplicate dns record removed", slog.String("record", domain), slog.String("ip", record.Content))
+		slog.Info("duplicate dns record removed",
+			slog.String("record", domain),
+			slog.String("type", typ),
+			slog.String("ip", record.Content),
+		)
 	}
 
 	return result, nil
 }
 
-func (t *Sync) updateRecord(ctx context.Context, recordID string, domain string, ipStr string, proxied bool) error {
+func (t *Sync) updateRecord(ctx context.Context, recordID string, domain string, typ string, ipStr string, proxied bool) error {
 	_, err := t.cloudflare.DNS.Records.Update(ctx, recordID, dns.RecordUpdateParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
-		Body: dns.ARecordParam{
-			Type:    cloudflare.F(dns.ARecordTypeA),
-			Name:    cloudflare.String(domain),
-			Content: cloudflare.String(ipStr),
-			Proxied: cloudflare.Bool(proxied),
-			Comment: cloudflare.String(managedComment),
-		},
+		Body:   recordParam(typ, domain, ipStr, proxied),
 	})
 	if err != nil {
 		return fmt.Errorf("update record(%s): %w", domain, err)
@@ -299,12 +363,11 @@ func (t *Sync) updateRecord(ctx context.Context, recordID string, domain string,
 	return nil
 }
 
-// cleanupRecords removes managed A records whose domain is not in keep,
+// cleanupRecords removes managed A and AAAA records that are not in keep,
 // logging each failure and returning how many records were removed and failed.
-func (t *Sync) cleanupRecords(ctx context.Context, keep map[string]struct{}) (removed, failed int) {
+func (t *Sync) cleanupRecords(ctx context.Context, keep map[recordKey]struct{}) (removed, failed int) {
 	iter := t.cloudflare.DNS.Records.ListAutoPaging(ctx, dns.RecordListParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
-		Type:   cloudflare.F(dns.RecordListParamsTypeA),
 		Comment: cloudflare.F(dns.RecordListParamsComment{
 			Exact: cloudflare.String(managedComment),
 		}),
@@ -318,7 +381,11 @@ func (t *Sync) cleanupRecords(ctx context.Context, keep map[string]struct{}) (re
 		if record.Comment != managedComment {
 			continue
 		}
-		if _, ok := keep[strings.ToLower(record.Name)]; ok {
+		typ := string(record.Type)
+		if typ != typeA && typ != typeAAAA {
+			continue
+		}
+		if _, ok := keep[recordKey{typ: typ, name: strings.ToLower(record.Name)}]; ok {
 			continue
 		}
 		stale = append(stale, record)
@@ -330,11 +397,19 @@ func (t *Sync) cleanupRecords(ctx context.Context, keep map[string]struct{}) (re
 
 	for _, record := range stale {
 		if err := t.deleteRecord(ctx, record.ID); err != nil {
-			slog.Error("remove stale dns record failed", slog.String("record", record.Name), slog.Any("error", err))
+			slog.Error("remove stale dns record failed",
+				slog.String("record", record.Name),
+				slog.String("type", string(record.Type)),
+				slog.Any("error", err),
+			)
 			failed++
 			continue
 		}
-		slog.Info("stale dns record removed", slog.String("record", record.Name), slog.String("ip", record.Content))
+		slog.Info("stale dns record removed",
+			slog.String("record", record.Name),
+			slog.String("type", string(record.Type)),
+			slog.String("ip", record.Content),
+		)
 		removed++
 	}
 	return removed, failed
