@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/netip"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
+	"github.com/google/uuid"
 	"github.com/urfave/cli/v3"
 
 	_ "golang.org/x/crypto/x509roots/fallback"
@@ -47,16 +48,6 @@ var rootCmd = &cli.Command{
 			Usage:    "Cloudflare Zone Domain (Required)",
 		},
 		&cli.StringFlag{
-			Name:    "dns-resolver",
-			Sources: cli.EnvVars("DNS_RESOLVER"),
-			Usage:   "DNS Resolver",
-			Value:   "8.8.8.8:53",
-			Validator: func(s string) error {
-				_, err := netip.ParseAddrPort(s)
-				return err
-			},
-		},
-		&cli.StringFlag{
 			Name:    "sync-interval",
 			Sources: cli.EnvVars("SYNC_INTERVAL"),
 			Usage:   "Sync Interval",
@@ -78,7 +69,6 @@ var rootCmd = &cli.Command{
 		t := sync.New(&sync.Config{
 			NetbirdEndpoint:    cmd.String("netbird-endpoint"),
 			NetbirdAccessToken: cmd.String("netbird-access-token"),
-			DNSResolver:        cmd.String("dns-resolver"),
 			CloudflareAPIToken: cmd.String("cloudflare-api-token"),
 			CloudflareDomain:   cmd.String("cloudflare-domain"),
 		})
@@ -96,6 +86,12 @@ var rootCmd = &cli.Command{
 			gocron.DurationJob(interval),
 			gocron.NewTask(t.Run),
 			gocron.WithStartAt(gocron.WithStartImmediately()),
+			gocron.WithSingletonMode(gocron.LimitModeReschedule),
+			gocron.WithEventListeners(
+				gocron.AfterJobRunsWithError(func(_ uuid.UUID, _ string, err error) {
+					slog.Error("sync failed", slog.Any("error", err))
+				}),
+			),
 		)
 		if err != nil {
 			return fmt.Errorf("new job: %w", err)
@@ -103,14 +99,21 @@ var rootCmd = &cli.Command{
 
 		s.Start()
 
-		done := make(chan os.Signal, 1)
-		signal.Notify(done, os.Interrupt, syscall.SIGTERM)
-		<-done
-		return nil
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		<-ctx.Done()
 
+		slog.Info("shutting down")
+		if err := s.Shutdown(); err != nil {
+			return fmt.Errorf("shutdown scheduler: %w", err)
+		}
+		return nil
 	},
 }
 
 func main() {
-	_ = rootCmd.Run(context.Background(), os.Args)
+	if err := rootCmd.Run(context.Background(), os.Args); err != nil {
+		slog.Error("exit with error", slog.Any("error", err))
+		os.Exit(1)
+	}
 }
