@@ -18,6 +18,10 @@ import (
 	"github.com/ix64/netbird-dns-sync/internal/netbird"
 )
 
+// managedComment marks DNS records owned by netbird-dns-sync.
+// Only records carrying it are removed once their peer is gone.
+const managedComment = "managed-by: netbird-dns-sync"
+
 type Config struct {
 	NetbirdEndpoint    string
 	NetbirdAccessToken string
@@ -59,6 +63,7 @@ func (t *Sync) Run(ctx context.Context) error {
 
 	var errs []error
 	var synced, skipped int
+	keep := make(map[string]struct{}, len(resp))
 	for _, v := range resp {
 		if _, ok := t.recordName(v.DNSLabel); !ok || v.IP == "" {
 			slog.Warn("peer skipped",
@@ -69,6 +74,7 @@ func (t *Sync) Run(ctx context.Context) error {
 			skipped++
 			continue
 		}
+		keep[strings.ToLower(v.DNSLabel)] = struct{}{}
 		if err := t.syncRecord(ctx, v.DNSLabel, v.IP); err != nil {
 			slog.Error("sync record failed", slog.String("domain", v.DNSLabel), slog.Any("error", err))
 			errs = append(errs, fmt.Errorf("sync record(%s): %w", v.DNSLabel, err))
@@ -76,9 +82,16 @@ func (t *Sync) Run(ctx context.Context) error {
 		}
 		synced++
 	}
+
+	removed, err := t.cleanupRecords(ctx, keep)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("cleanup records: %w", err))
+	}
+
 	slog.Info("sync completed",
 		slog.Int("synced", synced),
 		slog.Int("skipped", skipped),
+		slog.Int("removed", removed),
 		slog.Int("failed", len(errs)),
 	)
 	return errors.Join(errs...)
@@ -151,6 +164,7 @@ func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) er
 			Name:    cloudflare.String(name),
 			Content: cloudflare.String(ipStr),
 			Proxied: cloudflare.Bool(false),
+			Comment: cloudflare.String(managedComment),
 		},
 	})
 	if err != nil {
@@ -181,22 +195,33 @@ func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) erro
 		return nil
 	}
 
-	var keepID string
-	for _, record := range list.Result {
+	keepIdx := -1
+	for i, record := range list.Result {
 		if record.Content == ipStr {
-			keepID = record.ID
+			keepIdx = i
 			break
 		}
 	}
 
-	if keepID == "" {
+	var keepID string
+	switch {
+	case keepIdx < 0:
 		target := list.Result[0]
 		if err := t.updateRecord(ctx, target.ID, domain, ipStr, target.Proxied); err != nil {
 			return err
 		}
 		keepID = target.ID
 		slog.Info("dns record updated", slog.String("domain", domain), slog.String("ip", ipStr))
-	} else {
+	case list.Result[keepIdx].Comment != managedComment:
+		// adopt records created before ownership marking, so they can be cleaned up later
+		target := list.Result[keepIdx]
+		if err := t.updateRecord(ctx, target.ID, domain, ipStr, target.Proxied); err != nil {
+			return err
+		}
+		keepID = target.ID
+		slog.Info("dns record adopted", slog.String("domain", domain), slog.String("ip", ipStr))
+	default:
+		keepID = list.Result[keepIdx].ID
 		slog.Info("dns record exist", slog.String("domain", domain), slog.String("ip", ipStr))
 	}
 
@@ -221,12 +246,54 @@ func (t *Sync) updateRecord(ctx context.Context, recordID string, domain string,
 			Name:    cloudflare.String(domain),
 			Content: cloudflare.String(ipStr),
 			Proxied: cloudflare.Bool(proxied),
+			Comment: cloudflare.String(managedComment),
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("update record(%s): %w", domain, err)
 	}
 	return nil
+}
+
+// cleanupRecords removes managed A records whose domain is not in keep,
+// returning the number of records removed.
+func (t *Sync) cleanupRecords(ctx context.Context, keep map[string]struct{}) (int, error) {
+	iter := t.cloudflare.DNS.Records.ListAutoPaging(ctx, dns.RecordListParams{
+		ZoneID: cloudflare.String(t.cloudflareZoneID),
+		Type:   cloudflare.F(dns.RecordListParamsTypeA),
+		Comment: cloudflare.F(dns.RecordListParamsComment{
+			Exact: cloudflare.String(managedComment),
+		}),
+	})
+
+	// collect first: deleting while paging would shift later pages
+	var stale []dns.RecordResponse
+	for iter.Next() {
+		record := iter.Current()
+		// the comment filter is case-insensitive; only delete exact matches
+		if record.Comment != managedComment {
+			continue
+		}
+		if _, ok := keep[strings.ToLower(record.Name)]; ok {
+			continue
+		}
+		stale = append(stale, record)
+	}
+	if err := iter.Err(); err != nil {
+		return 0, fmt.Errorf("list managed records: %w", err)
+	}
+
+	var errs []error
+	var removed int
+	for _, record := range stale {
+		if err := t.deleteRecord(ctx, record.ID); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		slog.Info("stale dns record removed", slog.String("domain", record.Name), slog.String("ip", record.Content))
+		removed++
+	}
+	return removed, errors.Join(errs...)
 }
 
 func (t *Sync) deleteRecord(ctx context.Context, recordID string) error {

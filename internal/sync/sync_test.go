@@ -22,6 +22,7 @@ type fakeRecord struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
 	Content string `json:"content"`
+	Comment string `json:"comment"`
 }
 
 type fakeServer struct {
@@ -53,18 +54,28 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			{DNSLabel: "other.netbird.cloud", IP: "100.64.0.4"},
 			{DNSLabel: "broken.example.com", IP: "100.64.0.5"},
 			{DNSLabel: "dup.example.com", IP: "100.64.0.6"},
+			{DNSLabel: "adopt.example.com", IP: "100.64.0.7"},
+			{DNSLabel: "Mixed.example.com", IP: "100.64.0.8"},
 		})
 
 	case r.URL.Path == "/zones":
 		reply(http.StatusOK, []map[string]any{{"id": "zone1", "name": "example.com"}})
 
 	case r.URL.Path == "/zones/zone1/dns_records" && r.Method == http.MethodGet:
-		name := r.URL.Query().Get("name.exact")
+		q := r.URL.Query()
+		if page := q.Get("page"); page != "" && page != "1" {
+			reply(http.StatusOK, []fakeRecord{})
+			return
+		}
 		var out []fakeRecord
 		for _, rec := range f.records {
-			if rec.Name == name {
-				out = append(out, rec)
+			if q.Has("name.exact") && !strings.EqualFold(rec.Name, q.Get("name.exact")) {
+				continue
 			}
+			if q.Has("comment.exact") && !strings.EqualFold(rec.Comment, q.Get("comment.exact")) {
+				continue
+			}
+			out = append(out, rec)
 		}
 		reply(http.StatusOK, out)
 
@@ -89,6 +100,7 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for i := range f.records {
 			if f.records[i].ID == id {
 				f.records[i].Content = rec.Content
+				f.records[i].Comment = rec.Comment
 			}
 		}
 		reply(http.StatusOK, rec)
@@ -107,10 +119,15 @@ func TestRun(t *testing.T) {
 	fake := &fakeServer{
 		failFor: "broken.example.com",
 		records: []fakeRecord{
-			{ID: "r-same", Name: "same.example.com", Type: "A", Content: "100.64.0.2"},
+			{ID: "r-same", Name: "same.example.com", Type: "A", Content: "100.64.0.2", Comment: managedComment},
 			{ID: "r-changed", Name: "changed.example.com", Type: "A", Content: "1.1.1.1"},
 			{ID: "r-dup1", Name: "dup.example.com", Type: "A", Content: "2.2.2.2"},
 			{ID: "r-dup2", Name: "dup.example.com", Type: "A", Content: "100.64.0.6"},
+			{ID: "r-adopt", Name: "adopt.example.com", Type: "A", Content: "100.64.0.7", Comment: "set by hand"},
+			{ID: "r-mixed", Name: "mixed.example.com", Type: "A", Content: "100.64.0.8", Comment: managedComment},
+			{ID: "r-stale", Name: "gone.example.com", Type: "A", Content: "100.64.0.9", Comment: managedComment},
+			{ID: "r-manual", Name: "manual.example.com", Type: "A", Content: "1.2.3.4"},
+			{ID: "r-similar", Name: "similar.example.com", Type: "A", Content: "1.2.3.5", Comment: strings.ToUpper(managedComment)},
 		},
 	}
 	srv := httptest.NewServer(fake)
@@ -142,6 +159,10 @@ func TestRun(t *testing.T) {
 		"same.example.com":    {"100.64.0.2"},
 		"changed.example.com": {"100.64.0.3"},
 		"dup.example.com":     {"100.64.0.6"},
+		"adopt.example.com":   {"100.64.0.7"},
+		"mixed.example.com":   {"100.64.0.8"},
+		"manual.example.com":  {"1.2.3.4"},
+		"similar.example.com": {"1.2.3.5"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("records = %v, want %v", got, want)
@@ -152,8 +173,15 @@ func TestRun(t *testing.T) {
 		}
 	}
 
+	for _, rec := range fake.records {
+		unmanaged := rec.Name == "manual.example.com" || rec.Name == "similar.example.com"
+		if !unmanaged && rec.Comment != managedComment {
+			t.Errorf("records[%s].comment = %q, want %q", rec.Name, rec.Comment, managedComment)
+		}
+	}
+
 	for _, call := range fake.calls {
-		if strings.Contains(call, "r-same") {
+		if strings.Contains(call, "r-same") || strings.Contains(call, "r-mixed") {
 			t.Errorf("unexpected call on up-to-date record: %s", call)
 		}
 	}
