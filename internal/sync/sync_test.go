@@ -1,8 +1,10 @@
 package sync
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -145,9 +147,30 @@ func TestRun(t *testing.T) {
 		option.WithMaxRetries(0),
 	)
 
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
 	err := s.Run(t.Context())
-	if err == nil || !strings.Contains(err.Error(), "broken.example.com") {
-		t.Fatalf("expected error for broken.example.com, got %v", err)
+	if err == nil || err.Error() != "1 record operations failed" {
+		t.Fatalf("expected 1 failed operation, got %v", err)
+	}
+
+	out := logs.String()
+	for _, want := range []string{
+		`msg="sync record failed" record=broken.example.com`,
+		`msg="sync completed" created=1 updated=3 unchanged=2 removed=1 skipped=1 failed=1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("logs missing %q:\n%s", want, out)
+		}
+	}
+	// per-peer noise stays at debug
+	for _, noise := range []string{"dns record unchanged", "peer skipped"} {
+		if strings.Contains(out, noise) {
+			t.Errorf("logs contain debug message %q at info level:\n%s", noise, out)
+		}
 	}
 
 	got := map[string][]string{}
@@ -184,6 +207,20 @@ func TestRun(t *testing.T) {
 		if strings.Contains(call, "r-same") || strings.Contains(call, "r-mixed") {
 			t.Errorf("unexpected call on up-to-date record: %s", call)
 		}
+	}
+}
+
+func TestGetPeersErrorBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"message":"token invalid"}`, http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	s := New(&Config{NetbirdEndpoint: srv.URL, NetbirdAccessToken: "token"})
+	_, err := s.getPeers(t.Context())
+	want := `http get: 401 Unauthorized: {"message":"token invalid"}`
+	if err == nil || err.Error() != want {
+		t.Fatalf("getPeers error = %v, want %q", err, want)
 	}
 }
 

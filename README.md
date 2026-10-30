@@ -32,6 +32,8 @@ for now, Cloudflare DNS supported only.
 | `CLOUDFLARE_DOMAIN`    | yes      |         | Cloudflare Zone Domain (e.g. `example.com`)                    |
 | `CLOUDFLARE_API_TOKEN` | yes      |         | Cloudflare API Token, needs `Zone:Read` and `DNS:Edit`         |
 | `SYNC_INTERVAL`        | no       | `15m`   | Sync interval, Go duration format (e.g. `30s`, `5m`, `1h`)     |
+| `LOG_LEVEL`            | no       | `info`  | `debug`, `info`, `warn` or `error`; `debug` adds per-peer detail |
+| `LOG_FORMAT`           | no       | `text`  | `text` or `json`                                               |
 
 Only peers whose DNS label ends with `.<CLOUDFLARE_DOMAIN>` are synced,
 so the Netbird DNS domain should be set to the Cloudflare zone (or a subdomain of it).
