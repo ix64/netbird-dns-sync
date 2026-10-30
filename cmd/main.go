@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -63,9 +64,37 @@ var rootCmd = &cli.Command{
 				return nil
 			},
 		},
+		&cli.StringFlag{
+			Name:    "log-level",
+			Sources: cli.EnvVars("LOG_LEVEL"),
+			Usage:   "Log Level (debug, info, warn, error)",
+			Value:   "info",
+			Validator: func(s string) error {
+				var l slog.Level
+				return l.UnmarshalText([]byte(s))
+			},
+		},
+		&cli.StringFlag{
+			Name:    "log-format",
+			Sources: cli.EnvVars("LOG_FORMAT"),
+			Usage:   "Log Format (text, json)",
+			Value:   "text",
+			Validator: func(s string) error {
+				if s != "text" && s != "json" {
+					return errors.New("log-format must be text or json")
+				}
+				return nil
+			},
+		},
 	},
 
 	Action: func(ctx context.Context, cmd *cli.Command) error {
+		var level slog.Level
+		if err := level.UnmarshalText([]byte(cmd.String("log-level"))); err != nil {
+			return fmt.Errorf("parse log-level: %w", err)
+		}
+		slog.SetDefault(newLogger(cmd.String("log-format"), level))
+
 		t := sync.New(&sync.Config{
 			NetbirdEndpoint:    cmd.String("netbird-endpoint"),
 			NetbirdAccessToken: cmd.String("netbird-access-token"),
@@ -82,6 +111,13 @@ var rootCmd = &cli.Command{
 		if err != nil {
 			return fmt.Errorf("parse sync-interval: %w", err)
 		}
+		slog.Info("starting",
+			slog.String("netbird_endpoint", cmd.String("netbird-endpoint")),
+			slog.String("zone", cmd.String("cloudflare-domain")),
+			slog.String("interval", interval.String()),
+			slog.String("log_level", level.String()),
+		)
+
 		_, err = s.NewJob(
 			gocron.DurationJob(interval),
 			gocron.NewTask(t.Run),
@@ -109,6 +145,23 @@ var rootCmd = &cli.Command{
 		}
 		return nil
 	},
+}
+
+func newLogger(format string, level slog.Level) *slog.Logger {
+	opts := &slog.HandlerOptions{
+		Level: level,
+		// API errors may carry trailing newlines; keep each entry on one line
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if err, ok := a.Value.Any().(error); ok {
+				return slog.String(a.Key, strings.TrimSpace(err.Error()))
+			}
+			return a
+		},
+	}
+	if format == "json" {
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, opts))
 }
 
 func main() {

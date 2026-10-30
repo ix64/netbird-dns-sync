@@ -3,8 +3,8 @@ package sync
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -21,6 +21,15 @@ import (
 // managedComment marks DNS records owned by netbird-dns-sync.
 // Only records carrying it are removed once their peer is gone.
 const managedComment = "managed-by: netbird-dns-sync"
+
+// syncResult is what syncing a peer's record changed.
+type syncResult int
+
+const (
+	resultUnchanged syncResult = iota
+	resultCreated
+	resultUpdated
+)
 
 type Config struct {
 	NetbirdEndpoint    string
@@ -49,52 +58,74 @@ func New(cfg *Config) *Sync {
 }
 
 func (t *Sync) Run(ctx context.Context) error {
+	start := time.Now()
 
 	resp, err := t.getPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("get peers: %w", err)
 	}
-	slog.Info("netbird peers", slog.Int("count", len(resp)))
+	slog.Debug("netbird peers fetched", slog.Int("count", len(resp)))
 
 	if err := t.initZone(ctx); err != nil {
 		return fmt.Errorf("init zone: %w", err)
 	}
-	slog.Info("zone ready", slog.String("domain", t.cfg.CloudflareDomain))
 
-	var errs []error
-	var synced, skipped int
+	var created, updated, unchanged, skipped, failed int
 	keep := make(map[string]struct{}, len(resp))
 	for _, v := range resp {
-		if _, ok := t.recordName(v.DNSLabel); !ok || v.IP == "" {
-			slog.Warn("peer skipped",
-				slog.String("dns_label", v.DNSLabel),
+		if reason := t.skipReason(v); reason != "" {
+			slog.Debug("peer skipped",
+				slog.String("record", v.DNSLabel),
 				slog.String("ip", v.IP),
-				slog.String("reason", "dns label not under zone or ip empty"),
+				slog.String("reason", reason),
 			)
 			skipped++
 			continue
 		}
 		keep[strings.ToLower(v.DNSLabel)] = struct{}{}
-		if err := t.syncRecord(ctx, v.DNSLabel, v.IP); err != nil {
-			slog.Error("sync record failed", slog.String("domain", v.DNSLabel), slog.Any("error", err))
-			errs = append(errs, fmt.Errorf("sync record(%s): %w", v.DNSLabel, err))
+		result, err := t.syncRecord(ctx, v.DNSLabel, v.IP)
+		if err != nil {
+			slog.Error("sync record failed", slog.String("record", v.DNSLabel), slog.Any("error", err))
+			failed++
 			continue
 		}
-		synced++
+		switch result {
+		case resultCreated:
+			created++
+		case resultUpdated:
+			updated++
+		default:
+			unchanged++
+		}
 	}
 
-	removed, err := t.cleanupRecords(ctx, keep)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("cleanup records: %w", err))
-	}
+	removed, cleanupFailed := t.cleanupRecords(ctx, keep)
+	failed += cleanupFailed
 
 	slog.Info("sync completed",
-		slog.Int("synced", synced),
-		slog.Int("skipped", skipped),
+		slog.Int("created", created),
+		slog.Int("updated", updated),
+		slog.Int("unchanged", unchanged),
 		slog.Int("removed", removed),
-		slog.Int("failed", len(errs)),
+		slog.Int("skipped", skipped),
+		slog.Int("failed", failed),
+		slog.String("duration", time.Since(start).Round(time.Millisecond).String()),
 	)
-	return errors.Join(errs...)
+	if failed > 0 {
+		return fmt.Errorf("%d record operations failed", failed)
+	}
+	return nil
+}
+
+// skipReason returns why a peer gets no record, or "" if it should be synced.
+func (t *Sync) skipReason(p netbird.Peer) string {
+	if p.IP == "" {
+		return "no ip"
+	}
+	if _, ok := t.recordName(p.DNSLabel); !ok {
+		return "not under zone"
+	}
+	return ""
 }
 
 // recordName returns the record name relative to the zone,
@@ -123,7 +154,8 @@ func (t *Sync) getPeers(ctx context.Context) ([]netbird.Peer, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http get: %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("http get: %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 
 	var respBody []netbird.Peer
@@ -147,7 +179,10 @@ func (t *Sync) initZone(ctx context.Context) error {
 	}
 
 	t.cloudflareZoneID = ret.Result[0].ID
-	slog.Info("cloudflare zone initialized", slog.String("zone_id", t.cloudflareZoneID))
+	slog.Debug("cloudflare zone resolved",
+		slog.String("zone", t.cfg.CloudflareDomain),
+		slog.String("zone_id", t.cloudflareZoneID),
+	)
 	return nil
 }
 
@@ -174,7 +209,7 @@ func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) er
 	return nil
 }
 
-func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) error {
+func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) (syncResult, error) {
 	list, err := t.cloudflare.DNS.Records.List(ctx, dns.RecordListParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
 		Name: cloudflare.F(dns.RecordListParamsName{
@@ -183,16 +218,16 @@ func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) erro
 		Type: cloudflare.F(dns.RecordListParamsTypeA),
 	})
 	if err != nil {
-		return fmt.Errorf("list record(%s): %w", domain, err)
+		return 0, fmt.Errorf("list record(%s): %w", domain, err)
 	}
 
 	// create if empty
 	if len(list.Result) == 0 {
 		if err := t.createRecord(ctx, domain, ipStr); err != nil {
-			return err
+			return 0, err
 		}
-		slog.Info("dns record setup", slog.String("domain", domain), slog.String("ip", ipStr))
-		return nil
+		slog.Info("dns record created", slog.String("record", domain), slog.String("ip", ipStr))
+		return resultCreated, nil
 	}
 
 	keepIdx := -1
@@ -203,26 +238,32 @@ func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) erro
 		}
 	}
 
+	result := resultUpdated
 	var keepID string
 	switch {
 	case keepIdx < 0:
 		target := list.Result[0]
 		if err := t.updateRecord(ctx, target.ID, domain, ipStr, target.Proxied); err != nil {
-			return err
+			return 0, err
 		}
 		keepID = target.ID
-		slog.Info("dns record updated", slog.String("domain", domain), slog.String("ip", ipStr))
+		slog.Info("dns record updated",
+			slog.String("record", domain),
+			slog.String("ip", ipStr),
+			slog.String("old_ip", target.Content),
+		)
 	case list.Result[keepIdx].Comment != managedComment:
 		// adopt records created before ownership marking, so they can be cleaned up later
 		target := list.Result[keepIdx]
 		if err := t.updateRecord(ctx, target.ID, domain, ipStr, target.Proxied); err != nil {
-			return err
+			return 0, err
 		}
 		keepID = target.ID
-		slog.Info("dns record adopted", slog.String("domain", domain), slog.String("ip", ipStr))
+		slog.Info("dns record adopted", slog.String("record", domain), slog.String("ip", ipStr))
 	default:
 		keepID = list.Result[keepIdx].ID
-		slog.Info("dns record exist", slog.String("domain", domain), slog.String("ip", ipStr))
+		result = resultUnchanged
+		slog.Debug("dns record unchanged", slog.String("record", domain), slog.String("ip", ipStr))
 	}
 
 	for _, record := range list.Result {
@@ -230,12 +271,13 @@ func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) erro
 			continue
 		}
 		if err := t.deleteRecord(ctx, record.ID); err != nil {
-			return err
+			return 0, err
 		}
-		slog.Info("dns record removed", slog.String("domain", domain), slog.String("ip", record.Content))
+		result = resultUpdated
+		slog.Info("duplicate dns record removed", slog.String("record", domain), slog.String("ip", record.Content))
 	}
 
-	return nil
+	return result, nil
 }
 
 func (t *Sync) updateRecord(ctx context.Context, recordID string, domain string, ipStr string, proxied bool) error {
@@ -256,8 +298,8 @@ func (t *Sync) updateRecord(ctx context.Context, recordID string, domain string,
 }
 
 // cleanupRecords removes managed A records whose domain is not in keep,
-// returning the number of records removed.
-func (t *Sync) cleanupRecords(ctx context.Context, keep map[string]struct{}) (int, error) {
+// logging each failure and returning how many records were removed and failed.
+func (t *Sync) cleanupRecords(ctx context.Context, keep map[string]struct{}) (removed, failed int) {
 	iter := t.cloudflare.DNS.Records.ListAutoPaging(ctx, dns.RecordListParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
 		Type:   cloudflare.F(dns.RecordListParamsTypeA),
@@ -280,20 +322,20 @@ func (t *Sync) cleanupRecords(ctx context.Context, keep map[string]struct{}) (in
 		stale = append(stale, record)
 	}
 	if err := iter.Err(); err != nil {
-		return 0, fmt.Errorf("list managed records: %w", err)
+		slog.Error("list managed records failed", slog.Any("error", err))
+		return 0, 1
 	}
 
-	var errs []error
-	var removed int
 	for _, record := range stale {
 		if err := t.deleteRecord(ctx, record.ID); err != nil {
-			errs = append(errs, err)
+			slog.Error("remove stale dns record failed", slog.String("record", record.Name), slog.Any("error", err))
+			failed++
 			continue
 		}
-		slog.Info("stale dns record removed", slog.String("domain", record.Name), slog.String("ip", record.Content))
+		slog.Info("stale dns record removed", slog.String("record", record.Name), slog.String("ip", record.Content))
 		removed++
 	}
-	return removed, errors.Join(errs...)
+	return removed, failed
 }
 
 func (t *Sync) deleteRecord(ctx context.Context, recordID string) error {
