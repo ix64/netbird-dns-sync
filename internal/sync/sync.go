@@ -3,9 +3,9 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -22,15 +22,11 @@ type Config struct {
 	NetbirdEndpoint    string
 	NetbirdAccessToken string
 
-	DNSResolver string
-
-	// TODO: multiple dns resolver support
 	CloudflareAPIToken string
 	CloudflareDomain   string
 }
 type Sync struct {
 	http             *http.Client
-	resolver         *net.Resolver
 	cfg              *Config
 	cloudflare       *cloudflare.Client
 	cloudflareZoneID string
@@ -38,24 +34,12 @@ type Sync struct {
 
 func New(cfg *Config) *Sync {
 	ret := &Sync{
-		http:     &http.Client{},
-		resolver: net.DefaultResolver,
+		http: &http.Client{Timeout: 30 * time.Second},
 		cloudflare: cloudflare.NewClient(
 			option.WithAPIToken(cfg.CloudflareAPIToken),
 		),
 		cfg: cfg,
 	}
-	if cfg.DNSResolver != "" {
-		ret.resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: time.Second}
-				return d.DialContext(ctx, "udp", cfg.DNSResolver)
-			},
-		}
-
-	}
-	// TODO: allow using different dns
 
 	return ret
 }
@@ -73,13 +57,41 @@ func (t *Sync) Run(ctx context.Context) error {
 	}
 	slog.Info("zone ready", slog.String("domain", t.cfg.CloudflareDomain))
 
+	var errs []error
+	var synced, skipped int
 	for _, v := range resp {
-		if err := t.syncRecord(ctx, v.DNSLabel, v.IP); err != nil {
-			return fmt.Errorf("sync record(%s): %w", v.DNSLabel, err)
+		if _, ok := t.recordName(v.DNSLabel); !ok || v.IP == "" {
+			slog.Warn("peer skipped",
+				slog.String("dns_label", v.DNSLabel),
+				slog.String("ip", v.IP),
+				slog.String("reason", "dns label not under zone or ip empty"),
+			)
+			skipped++
+			continue
 		}
+		if err := t.syncRecord(ctx, v.DNSLabel, v.IP); err != nil {
+			slog.Error("sync record failed", slog.String("domain", v.DNSLabel), slog.Any("error", err))
+			errs = append(errs, fmt.Errorf("sync record(%s): %w", v.DNSLabel, err))
+			continue
+		}
+		synced++
 	}
-	slog.Info("sync completed", slog.Int("records", len(resp)))
-	return nil
+	slog.Info("sync completed",
+		slog.Int("synced", synced),
+		slog.Int("skipped", skipped),
+		slog.Int("failed", len(errs)),
+	)
+	return errors.Join(errs...)
+}
+
+// recordName returns the record name relative to the zone,
+// or false if domain is not under the zone.
+func (t *Sync) recordName(domain string) (string, bool) {
+	name, ok := strings.CutSuffix(domain, "."+t.cfg.CloudflareDomain)
+	if !ok || name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 func (t *Sync) getPeers(ctx context.Context) ([]netbird.Peer, error) {
@@ -118,7 +130,7 @@ func (t *Sync) initZone(ctx context.Context) error {
 	}
 
 	if len(ret.Result) == 0 {
-		return fmt.Errorf("zone %s not found", cloudflare.String(t.cfg.CloudflareDomain))
+		return fmt.Errorf("zone %s not found", t.cfg.CloudflareDomain)
 	}
 
 	t.cloudflareZoneID = ret.Result[0].ID
@@ -127,7 +139,7 @@ func (t *Sync) initZone(ctx context.Context) error {
 }
 
 func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) error {
-	name, ok := strings.CutSuffix(domain, "."+t.cfg.CloudflareDomain)
+	name, ok := t.recordName(domain)
 	if !ok {
 		return fmt.Errorf("invalid domain %s without suffix %s", domain, t.cfg.CloudflareDomain)
 	}
@@ -149,10 +161,6 @@ func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) er
 }
 
 func (t *Sync) syncRecord(ctx context.Context, domain string, ipStr string) error {
-	if _, ok := strings.CutSuffix(domain, "."+t.cfg.CloudflareDomain); !ok {
-		return fmt.Errorf("invalid domain %s without suffix %s", domain, t.cfg.CloudflareDomain)
-	}
-
 	list, err := t.cloudflare.DNS.Records.List(ctx, dns.RecordListParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
 		Name: cloudflare.F(dns.RecordListParamsName{
