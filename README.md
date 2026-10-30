@@ -37,9 +37,12 @@ for now, Cloudflare DNS supported only.
 
 Only peers whose DNS label ends with `.<CLOUDFLARE_DOMAIN>` are synced,
 so the Netbird DNS domain should be set to the Cloudflare zone (or a subdomain of it).
-Other peers are skipped with a warning.
+Other peers are skipped (logged at `debug` level).
+
+Each peer gets an A record for its IPv4 address and, when IPv6 is enabled for it in Netbird
+(v0.71.0 or later, see the account's IPv6 settings), an AAAA record for its IPv6 address.
 
 Records written by the sync carry the comment `managed-by: netbird-dns-sync`.
-When a peer is removed from Netbird, its managed A record is deleted on the next sync.
-Records without that comment are never removed, except duplicate A records under a synced peer's name.
-Existing A records that match a peer are adopted (their comment is replaced) on the next sync.
+When a peer is removed from Netbird, or loses its IPv6 address, its managed records are deleted on the next sync.
+Records without that comment are never removed, except duplicate A/AAAA records under a synced peer's name.
+Existing A/AAAA records that match a peer are adopted (their comment is replaced) on the next sync.

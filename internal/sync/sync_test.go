@@ -50,7 +50,7 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/api/peers":
 		_ = json.NewEncoder(w).Encode([]netbird.Peer{
-			{DNSLabel: "new.example.com", IP: "100.64.0.1"},
+			{DNSLabel: "new.example.com", IP: "100.64.0.1", IPv6: "fd00::1"},
 			{DNSLabel: "same.example.com", IP: "100.64.0.2"},
 			{DNSLabel: "changed.example.com", IP: "100.64.0.3"},
 			{DNSLabel: "other.netbird.cloud", IP: "100.64.0.4"},
@@ -58,6 +58,8 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			{DNSLabel: "dup.example.com", IP: "100.64.0.6"},
 			{DNSLabel: "adopt.example.com", IP: "100.64.0.7"},
 			{DNSLabel: "Mixed.example.com", IP: "100.64.0.8"},
+			{DNSLabel: "v6only.example.com", IPv6: "fd00::2"},
+			{DNSLabel: "norm.example.com", IP: "100.64.0.10", IPv6: "fd00::3"},
 		})
 
 	case r.URL.Path == "/zones":
@@ -75,6 +77,9 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if q.Has("comment.exact") && !strings.EqualFold(rec.Comment, q.Get("comment.exact")) {
+				continue
+			}
+			if q.Has("type") && rec.Type != q.Get("type") {
 				continue
 			}
 			out = append(out, rec)
@@ -130,6 +135,13 @@ func TestRun(t *testing.T) {
 			{ID: "r-stale", Name: "gone.example.com", Type: "A", Content: "100.64.0.9", Comment: managedComment},
 			{ID: "r-manual", Name: "manual.example.com", Type: "A", Content: "1.2.3.4"},
 			{ID: "r-similar", Name: "similar.example.com", Type: "A", Content: "1.2.3.5", Comment: strings.ToUpper(managedComment)},
+			// peer has no IPv6 any more
+			{ID: "r-same6", Name: "same.example.com", Type: "AAAA", Content: "fd00::99", Comment: managedComment},
+			// same addresses, IPv6 written in expanded form
+			{ID: "r-norm", Name: "norm.example.com", Type: "A", Content: "100.64.0.10", Comment: managedComment},
+			{ID: "r-norm6", Name: "norm.example.com", Type: "AAAA", Content: "fd00:0:0:0:0:0:0:3", Comment: managedComment},
+			// only A and AAAA records are ever cleaned up
+			{ID: "r-txt", Name: "txt.example.com", Type: "TXT", Content: "hello", Comment: managedComment},
 		},
 	}
 	srv := httptest.NewServer(fake)
@@ -160,7 +172,7 @@ func TestRun(t *testing.T) {
 	out := logs.String()
 	for _, want := range []string{
 		`msg="sync record failed" record=broken.example.com`,
-		`msg="sync completed" created=1 updated=3 unchanged=2 removed=1 skipped=1 failed=1`,
+		`msg="sync completed" created=3 updated=3 unchanged=4 removed=2 skipped=1 failed=1`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("logs missing %q:\n%s", want, out)
@@ -175,17 +187,23 @@ func TestRun(t *testing.T) {
 
 	got := map[string][]string{}
 	for _, rec := range fake.records {
-		got[rec.Name] = append(got[rec.Name], rec.Content)
+		key := rec.Type + " " + rec.Name
+		got[key] = append(got[key], rec.Content)
 	}
 	want := map[string][]string{
-		"new.example.com":     {"100.64.0.1"},
-		"same.example.com":    {"100.64.0.2"},
-		"changed.example.com": {"100.64.0.3"},
-		"dup.example.com":     {"100.64.0.6"},
-		"adopt.example.com":   {"100.64.0.7"},
-		"mixed.example.com":   {"100.64.0.8"},
-		"manual.example.com":  {"1.2.3.4"},
-		"similar.example.com": {"1.2.3.5"},
+		"A new.example.com":       {"100.64.0.1"},
+		"AAAA new.example.com":    {"fd00::1"},
+		"A same.example.com":      {"100.64.0.2"},
+		"A changed.example.com":   {"100.64.0.3"},
+		"A dup.example.com":       {"100.64.0.6"},
+		"A adopt.example.com":     {"100.64.0.7"},
+		"A mixed.example.com":     {"100.64.0.8"},
+		"AAAA v6only.example.com": {"fd00::2"},
+		"A norm.example.com":      {"100.64.0.10"},
+		"AAAA norm.example.com":   {"fd00:0:0:0:0:0:0:3"},
+		"A manual.example.com":    {"1.2.3.4"},
+		"A similar.example.com":   {"1.2.3.5"},
+		"TXT txt.example.com":     {"hello"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("records = %v, want %v", got, want)
@@ -204,7 +222,7 @@ func TestRun(t *testing.T) {
 	}
 
 	for _, call := range fake.calls {
-		if strings.Contains(call, "r-same") || strings.Contains(call, "r-mixed") {
+		if strings.HasSuffix(call, "/r-same") || strings.Contains(call, "r-mixed") || strings.Contains(call, "r-norm") {
 			t.Errorf("unexpected call on up-to-date record: %s", call)
 		}
 	}
