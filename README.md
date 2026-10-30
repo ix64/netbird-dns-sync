@@ -23,6 +23,33 @@ for now, Cloudflare DNS supported only.
           CLOUDFLARE_API_TOKEN: ......
     ```
 
+### Run once
+
+To schedule syncs yourself (a Kubernetes CronJob, a systemd timer, cron), pass `--once` or set `SYNC_ONCE=true`.
+The process runs one sync and exits: `0` on success, `1` if anything failed. `SYNC_INTERVAL` is ignored.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: netbird-dns-sync
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: netbird-dns-sync
+              image: ghcr.io/ix64/netbird-dns-sync:main
+              args: [ "/usr/local/bin/netbird-dns-sync", "--once" ]
+              envFrom:
+                - secretRef:
+                    name: netbird-dns-sync # NETBIRD_ENDPOINT, NETBIRD_ACCESS_TOKEN, CLOUDFLARE_DOMAIN, CLOUDFLARE_API_TOKEN
+```
+
 ## Configuration
 
 | Environment Variable   | Required | Default | Description                                                    |
@@ -32,6 +59,7 @@ for now, Cloudflare DNS supported only.
 | `CLOUDFLARE_DOMAIN`    | yes      |         | Cloudflare Zone Domain (e.g. `example.com`)                    |
 | `CLOUDFLARE_API_TOKEN` | yes      |         | Cloudflare API Token, needs `Zone:Read` and `DNS:Edit`         |
 | `SYNC_INTERVAL`        | no       | `15m`   | Sync interval, Go duration format (e.g. `30s`, `5m`, `1h`)     |
+| `SYNC_ONCE`            | no       | `false` | Run a single sync and exit (same as `--once`), see below       |
 | `LOG_LEVEL`            | no       | `info`  | `debug`, `info`, `warn` or `error`; `debug` adds per-peer detail |
 | `LOG_FORMAT`           | no       | `text`  | `text` or `json`                                               |
 
