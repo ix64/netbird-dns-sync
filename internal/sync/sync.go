@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -139,7 +140,13 @@ func (t *Sync) recordName(domain string) (string, bool) {
 }
 
 func (t *Sync) getPeers(ctx context.Context) ([]netbird.Peer, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.cfg.NetbirdEndpoint+"/api/peers", nil)
+	// JoinPath tolerates a trailing slash on the endpoint
+	u, err := url.JoinPath(t.cfg.NetbirdEndpoint, "api", "peers")
+	if err != nil {
+		return nil, fmt.Errorf("invalid netbird endpoint: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("http create request: %w", err)
 	}
@@ -187,16 +194,11 @@ func (t *Sync) initZone(ctx context.Context) error {
 }
 
 func (t *Sync) createRecord(ctx context.Context, domain string, ipStr string) error {
-	name, ok := t.recordName(domain)
-	if !ok {
-		return fmt.Errorf("invalid domain %s without suffix %s", domain, t.cfg.CloudflareDomain)
-	}
-
 	_, err := t.cloudflare.DNS.Records.New(ctx, dns.RecordNewParams{
 		ZoneID: cloudflare.String(t.cloudflareZoneID),
 		Body: dns.ARecordParam{
 			Type:    cloudflare.F(dns.ARecordTypeA),
-			Name:    cloudflare.String(name),
+			Name:    cloudflare.String(domain),
 			Content: cloudflare.String(ipStr),
 			Proxied: cloudflare.Bool(false),
 			Comment: cloudflare.String(managedComment),

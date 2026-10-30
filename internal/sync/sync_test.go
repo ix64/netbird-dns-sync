@@ -85,7 +85,7 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var rec fakeRecord
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &rec)
-		rec.Name += ".example.com"
+		// stored as sent: the sync must always send full names
 		if rec.Name == f.failFor {
 			reply(http.StatusBadRequest, nil)
 			return
@@ -221,6 +221,23 @@ func TestGetPeersErrorBody(t *testing.T) {
 	want := `http get: 401 Unauthorized: {"message":"token invalid"}`
 	if err == nil || err.Error() != want {
 		t.Fatalf("getPeers error = %v, want %q", err, want)
+	}
+}
+
+func TestGetPeersTrailingSlash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/peers" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]netbird.Peer{{DNSLabel: "peer.example.com", IP: "100.64.0.1"}})
+	}))
+	defer srv.Close()
+
+	s := New(&Config{NetbirdEndpoint: srv.URL + "/", NetbirdAccessToken: "token"})
+	peers, err := s.getPeers(t.Context())
+	if err != nil || len(peers) != 1 {
+		t.Fatalf("getPeers = %v, %v; want 1 peer", peers, err)
 	}
 }
 
