@@ -64,6 +64,11 @@ var rootCmd = &cli.Command{
 				return nil
 			},
 		},
+		&cli.BoolFlag{
+			Name:    "once",
+			Sources: cli.EnvVars("SYNC_ONCE"),
+			Usage:   "Run a single sync and exit, non-zero on failure (for cron jobs and timers)",
+		},
 		&cli.StringFlag{
 			Name:    "log-level",
 			Sources: cli.EnvVars("LOG_LEVEL"),
@@ -102,21 +107,38 @@ var rootCmd = &cli.Command{
 			CloudflareDomain:   cmd.String("cloudflare-domain"),
 		})
 
-		s, err := gocron.NewScheduler()
-		if err != nil {
-			return fmt.Errorf("new scheduler: %w", err)
-		}
-
 		interval, err := time.ParseDuration(cmd.String("sync-interval"))
 		if err != nil {
 			return fmt.Errorf("parse sync-interval: %w", err)
 		}
-		slog.Info("starting",
+
+		once := cmd.Bool("once")
+		attrs := []any{
 			slog.String("netbird_endpoint", cmd.String("netbird-endpoint")),
 			slog.String("zone", cmd.String("cloudflare-domain")),
-			slog.String("interval", interval.String()),
 			slog.String("log_level", level.String()),
-		)
+		}
+		if once {
+			attrs = append(attrs, slog.Bool("once", true))
+		} else {
+			attrs = append(attrs, slog.String("interval", interval.String()))
+		}
+		slog.Info("starting", attrs...)
+
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		if once {
+			if err := t.Run(ctx); err != nil {
+				return fmt.Errorf("sync failed: %w", err)
+			}
+			return nil
+		}
+
+		s, err := gocron.NewScheduler()
+		if err != nil {
+			return fmt.Errorf("new scheduler: %w", err)
+		}
 
 		_, err = s.NewJob(
 			gocron.DurationJob(interval),
@@ -134,9 +156,6 @@ var rootCmd = &cli.Command{
 		}
 
 		s.Start()
-
-		ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-		defer stop()
 		<-ctx.Done()
 
 		slog.Info("shutting down")
