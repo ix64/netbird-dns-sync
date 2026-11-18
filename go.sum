@@ -1,7 +1,7 @@
 github.com/cloudflare/cloudflare-go/v6 v6.10.0 h1:tm+YwMDAdxxy2eIAlLH9Wu8JWSMg6fE3j3ydZbMG6co=
 github.com/cloudflare/cloudflare-go/v6 v6.10.0/go.mod h1:Lj3MUqjvKctXRpdRhLQxZYRrNZHuRs0XYuH8JtQGyoI=
-github.com/go-co-op/gocron/v2 v2.23.0 h1:Qkhe0ZlUf3sRMCEuoXRi5VU/t8fi5lyD97eO+PsGJ4g=
-github.com/go-co-op/gocron/v2 v2.23.0/go.mod h1:QwAfxPmGC9tPDL5R9R3inaJYPDvYEXs/zkYrXD3L9jk=
+github.com/go-co-op/gocron/v2 v2.23.1 h1:DAM4k6jfBHaaaLS0yCps8Jdq3smQZRoEg+/hwR5bLlk=
+github.com/go-co-op/gocron/v2 v2.23.1/go.mod h1:QwAfxPmGC9tPDL5R9R3inaJYPDvYEXs/zkYrXD3L9jk=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/jonboulle/clockwork v0.5.0 h1:Hyh9A8u51kptdkR+cqRpT1EebBwTn1oK9YfGYbdFz6I=
